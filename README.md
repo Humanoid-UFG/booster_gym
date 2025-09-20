@@ -81,6 +81,19 @@ Follow these steps to set up your environment:
 
 ## Usage
 
+### DockerFile
+1. Download Isaac Gym from [NVIDIA’s website](https://developer.nvidia.com/isaac-gym/download).
+
+    Extract and install:
+
+2. Build: 
+
+sudo docker build -t booster-gym .
+
+3. Run container
+
+sudo docker run --gpus all -it --rm --name booster-gym-env booster-gym
+
 ### 1. Training
 
 To start training a policy, run the following command:
