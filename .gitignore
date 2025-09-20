@@ -1,0 +1,11 @@
+IsaacGym_Preview_4_Package.tar.gz
+.git
+*.md
+logs/
+videos/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.idea/
+.vscode/
