@@ -88,19 +88,36 @@ Follow these steps to set up your environment:
 
 2. Build: 
 
-sudo docker build -t booster-gym .
+docker build -t booster-gym .
 
 3. Run container
 
-sudo docker run --gpus all -it --rm --name booster-gym-env booster-gym
+If you want to see the simulation window, use everytime before running the container:
+
+xhost +local:docker
+
+docker run \
+    --gpus all \
+    -it \
+    --rm \
+    -e "DISPLAY=$DISPLAY" \
+    -e "NVIDIA_VISIBLE_DEVICES=all" \
+    -e "NVIDIA_DRIVER_CAPABILITIES=all" \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v $(pwd)/logs:/app/logs \
+    -v $(pwd)/videos:/app/videos \
+    --name booster-gym-env \
+    booster-gym
 
 ### 1. Training
 
 To start training a policy, run the following command:
 
 ```sh
-$ python train.py --task=T1
+$ python3 train.py --task=T1
 ```
+
+To train faster and not see the simulation window use flag: --headless True
 
 Training logs and saved models will be stored in `logs/<date-time>/`.
 

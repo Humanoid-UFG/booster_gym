@@ -11,3 +11,6 @@ __pycache__/
 *.pyd
 .idea/
 .vscode/
+IsaacGym_Preview_4_Package.tar.gz
+logs
+videos
