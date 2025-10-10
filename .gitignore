@@ -11,3 +11,4 @@ __pycache__/
 IsaacGym_Preview_4_Package.tar.gz
 logs
 videos
+wandb_key.txt
