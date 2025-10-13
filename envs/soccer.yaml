@@ -1,0 +1,87 @@
+# soccer_cfg.yaml
+# Configuração final e estável para o ambiente de visualização 'Soccer'.
+# Baseado no arquivo de treinamento T1 para garantir compatibilidade total.
+
+basic:
+  headless: false
+  sim_device: "cuda:0"
+  rl_device: "cuda:0"
+  seed: 42
+  description: "Configuração de visualização para o ambiente Soccer."
+
+env:
+  num_envs: 16
+  env_spacing: 5.0
+
+viewer:
+  pos: [5., -5., 4.]  # Posição da câmera para ver o campo
+  lookat: [2., 0., 1.] # Olhando para o centro da ação
+  record_video: false
+
+sim:
+  # Parâmetros de simulação copiados do arquivo original para garantir estabilidade
+  dt: 0.002
+  substeps: 1
+  up_axis: "z"
+  gravity: [0.0, 0.0, -9.81]
+  physics_engine: "physx"
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 4
+    num_velocity_iterations: 1
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: 4
+    contact_collection: 1
+
+asset:
+  # --- SEÇÃO CRÍTICA: Copiada do original para garantir carregamento correto ---
+  
+  # !!! VERIFIQUE SE ESTE CAMINHO ESTÁ CORRETO PARA O SEU PROJETO !!!
+  file: "resources/T1/T1_locomotion.urdf"
+
+  name: "T1"
+  disable_gravity: false
+  collapse_fixed_joints: true
+  fix_base_link: false
+  self_collisions: 0 # 0 para habilitar
+  flip_visual_attachments: false # Essencial para renderizar o robô corretamente
+
+  # Parâmetros físicos do asset para estabilidade
+  density: 0.001
+  angular_damping: 0.
+  linear_damping: 0.
+  max_angular_velocity: 1000.
+  max_linear_velocity: 1000.
+  armature: 0.
+  thickness: 0.01
+
+init_state:
+  # Posição inicial segura para evitar colisão no primeiro frame
+  pos: [0.0, 0.0, 1.0] # x,y,z [m]
+  rot: [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
+  lin_vel: [0.0, 0.0, 0.0]
+  ang_vel: [0.0, 0.0, 0.0]
+  default_joint_angles: {"default": 0.}
+
+terrain:
+  # Terreno plano simples para o campo de futebol
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.
+
+# As seções a seguir foram removidas por não serem necessárias para a visualização:
+# - runner
+# - algorithm
+# - control
+# - commands
+# - normalization
+# - noise
+# - randomization
+# - rewards
