@@ -57,12 +57,8 @@ class Soccer(BaseTask):
         # ... (código para criar a bola e o gol permanece o mesmo)
         ball_options = gymapi.AssetOptions()
         ball_options.disable_gravity = False
-        ball_radius = 0.15
+        ball_radius = 0.11
         ball_asset = self.gym.create_sphere(self.sim, ball_radius, ball_options)
-        goal_options = gymapi.AssetOptions()
-        goal_options.fix_base_link = True
-        goal_dims = gymapi.Vec3(0.1, 1.8, 1.2)
-        goal_asset = self.gym.create_box(self.sim, goal_dims.x, goal_dims.y, goal_dims.z, goal_options)
         
         # Posição inicial do robô agora é lida do cfg para consistência
         init_state_cfg = self.cfg["init_state"]
@@ -71,8 +67,46 @@ class Soccer(BaseTask):
         
         ball_start_pose = gymapi.Transform()
         ball_start_pose.p = gymapi.Vec3(1.0, 0.0, ball_radius)
-        goal_start_pose = gymapi.Transform()
-        goal_start_pose.p = gymapi.Vec3(4.0, 0.0, goal_dims.z / 2.0)
+
+        # --- 3. Criar o Asset do Gol (em partes) ---
+        goal_options = gymapi.AssetOptions()
+        goal_options.fix_base_link = True # Todas as partes do gol são estáticas
+        
+        # Definir as dimensões do nosso gol
+        goal_width = 1.8  # Largura entre as traves
+        goal_height = 1.2 # Altura do travessão
+        post_thickness = 0.1 # Espessura das traves
+
+        # Criar o asset para as traves verticais
+        post_dims = gymapi.Vec3(post_thickness, post_thickness, goal_height)
+        post_asset = self.gym.create_box(self.sim, post_dims.x, post_dims.y, post_dims.z, goal_options)
+
+        # Criar o asset para o travessão horizontal
+        crossbar_dims = gymapi.Vec3(post_thickness, goal_width, post_thickness)
+        crossbar_asset = self.gym.create_box(self.sim, crossbar_dims.x, crossbar_dims.y, crossbar_dims.z, goal_options)
+        
+        # Posição inicial do robô agora é lida do cfg para consistência
+        init_state_cfg = self.cfg["init_state"]
+        robot_start_pose = gymapi.Transform()
+        robot_start_pose.p = gymapi.Vec3(*init_state_cfg["pos"])
+        
+        ball_start_pose = gymapi.Transform()
+        ball_start_pose.p = gymapi.Vec3(1.0, 0.0, ball_radius)
+
+        # Posições para cada parte do gol
+        goal_x_pos = 4.0 # Posição da linha do gol no eixo X
+        
+        # Pose da trave esquerda
+        left_post_pose = gymapi.Transform()
+        left_post_pose.p = gymapi.Vec3(goal_x_pos, -goal_width / 2, goal_height / 2)
+
+        # Pose da trave direita
+        right_post_pose = gymapi.Transform()
+        right_post_pose.p = gymapi.Vec3(goal_x_pos, goal_width / 2, goal_height / 2)
+
+        # Pose do travessão
+        crossbar_pose = gymapi.Transform()
+        crossbar_pose.p = gymapi.Vec3(goal_x_pos, 0, goal_height)
 
         env_lower = gymapi.Vec3(0.0, 0.0, 0.0)
         env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
@@ -84,9 +118,6 @@ class Soccer(BaseTask):
         for i in range(self.num_envs):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
             self.envs.append(env_handle)
-
-            # --- 2. ADICIONAR A CONFIGURAÇÃO PÓS-CRIAÇÃO ---
-            # Este bloco é a correção principal.
             
             # Adicionar o Robô
             robot_handle = self.gym.create_actor(
@@ -109,9 +140,16 @@ class Soccer(BaseTask):
             ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_start_pose, "ball", i, 0)
             self.ball_handles.append(ball_handle)
 
+            ball_props = self.gym.get_actor_rigid_body_properties(env_handle, ball_handle)
+            ball_props[0].mass = 0.43 # Massa oficial em kg
+            self.gym.set_actor_rigid_body_properties(env_handle, ball_handle, ball_props)
+
             # Adicionar o Gol
-            goal_handle = self.gym.create_actor(env_handle, goal_asset, goal_start_pose, "goal", i, 0)
-            self.goal_handles.append(goal_handle)
+            left_post_handle = self.gym.create_actor(env_handle, post_asset, left_post_pose, "left_post", i, 0)
+            right_post_handle = self.gym.create_actor(env_handle, post_asset, right_post_pose, "right_post", i, 0)
+            crossbar_handle = self.gym.create_actor(env_handle, crossbar_asset, crossbar_pose, "crossbar", i, 0)
+            
+            self.goal_handles.extend([left_post_handle, right_post_handle, crossbar_handle])
 
             # Configuração das juntas (DOFs)
             dof_props = self.gym.get_actor_dof_properties(env_handle, robot_handle)
