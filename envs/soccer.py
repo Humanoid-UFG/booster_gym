@@ -1,11 +1,8 @@
-# envs/soccer.py
-
 import os
 from isaacgym import gymtorch, gymapi
-from isaacgym.torch_utils import to_torch, quat_from_euler_xyz
+from isaacgym.torch_utils import to_torch, quat_from_euler_xyz, torch_rand_float
 import torch
 import numpy as np
-# A herança agora vem da sua BaseTask real
 from .base_task import BaseTask
 
 assert gymtorch
@@ -18,9 +15,15 @@ class Soccer(BaseTask):
         self.ball_handles = []
         self.goal_handles = []
         
+        self.field_dims = gymapi.Vec2(10.0, 6.0)
+        
+        self.wall_thickness = 0.1
         self._create_envs()
         self.gym.prepare_sim(self.sim)
         self._init_simulation_buffers()
+
+        self.kick_velocity = 10.0  
+        self._kick_applied = False
 
     def _create_envs(self):
         self.num_envs = self.cfg["env"]["num_envs"]
@@ -29,7 +32,6 @@ class Soccer(BaseTask):
         asset_file = os.path.basename(asset_cfg["file"])
 
         # --- 1. CARREGAR ASSETS ---
-        # Asset do Robô
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
         asset_options.collapse_fixed_joints = asset_cfg["collapse_fixed_joints"]
@@ -46,67 +48,98 @@ class Soccer(BaseTask):
         robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
         self.num_dofs = self.gym.get_asset_dof_count(robot_asset)
         
-        # Asset da Bola
         ball_options = gymapi.AssetOptions()
         ball_options.disable_gravity = False
-        self.ball_radius = 0.11 # Salva o raio para uso posterior
+        self.ball_radius = 0.11
         ball_asset = self.gym.create_sphere(self.sim, self.ball_radius, ball_options)
         
-        # Assets do Gol
         goal_options = gymapi.AssetOptions()
         goal_options.fix_base_link = True
-        goal_width = 1.8
-        goal_height = 1.2
-        post_thickness = 0.1
-        post_dims = gymapi.Vec3(post_thickness, post_thickness, goal_height)
-        post_asset = self.gym.create_box(self.sim, post_dims.x, post_dims.y, post_dims.z, goal_options)
-        crossbar_dims = gymapi.Vec3(post_thickness, goal_width, post_thickness)
-        crossbar_asset = self.gym.create_box(self.sim, crossbar_dims.x, crossbar_dims.y, crossbar_dims.z, goal_options)
-
-        # --- 2. DEFINIR POSES RELATIVAS (DENTRO DE UM AMBIENTE) ---
-        init_state_cfg = self.cfg["init_state"]
-        robot_start_pose = gymapi.Transform()
-        robot_start_pose.p = gymapi.Vec3(*init_state_cfg["pos"])
-        robot_start_pose.r = gymapi.Quat(*init_state_cfg["rot"])
-
-        ball_start_pose = gymapi.Transform()
-        ball_start_pose.p = gymapi.Vec3(1.0, 0.0, self.ball_radius)
+        goal_width, goal_height, post_thickness = 1.8, 1.2, 0.1
+        post_asset = self.gym.create_box(self.sim, post_thickness, post_thickness, goal_height, goal_options)
+        crossbar_asset = self.gym.create_box(self.sim, post_thickness, goal_width, post_thickness, goal_options)
         
-        goal_x_pos = 4.0
-        left_post_pose = gymapi.Transform()
-        left_post_pose.p = gymapi.Vec3(goal_x_pos, -goal_width / 2, goal_height / 2)
-        right_post_pose = gymapi.Transform()
-        right_post_pose.p = gymapi.Vec3(goal_x_pos, goal_width / 2, goal_height / 2)
-        crossbar_pose = gymapi.Transform()
-        crossbar_pose.p = gymapi.Vec3(goal_x_pos, 0, goal_height)
-        crossbar_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+        # --- CORREÇÃO 1: Geometria das Paredes ---
+        self.goal_x_pos = 4.0
+        back_wall_x = self.goal_x_pos - self.field_dims.x
+        goal_wall_x = self.goal_x_pos + 1.0 # Posição da parede atrás do gol
 
-        # --- 3. CRIAR AMBIENTES E ATORES EM UMA GRADE ---
+        wall_options = gymapi.AssetOptions()
+        wall_options.fix_base_link = True
+        wall_height = goal_height * 1.5
+
+        # Novo comprimento e centro para as paredes laterais
+        side_wall_length = goal_wall_x - back_wall_x
+        side_wall_center_x = (goal_wall_x + back_wall_x) / 2
+
+        side_wall_asset = self.gym.create_box(self.sim, side_wall_length, self.wall_thickness, wall_height, wall_options)
+        back_wall_asset = self.gym.create_box(self.sim, self.wall_thickness, self.field_dims.y, wall_height, wall_options)
+
+        # --- 2. DEFINIR POSES RELATIVAS ---
+        self.robot_initial_z = self.cfg["init_state"]["pos"][2]
+        self.initial_robot_quat = gymapi.Quat(*self.cfg["init_state"]["rot"])
+        
+        goal_physical_x = self.goal_x_pos + post_thickness / 2
+        left_post_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, -goal_width / 2, goal_height / 2))
+        right_post_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, goal_width / 2, goal_height / 2))
+        crossbar_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, 0, goal_height), r=gymapi.Quat(0,0,0,1))
+        
+        left_wall_y = -self.field_dims.y / 2
+        right_wall_y = self.field_dims.y / 2
+        
+        back_wall_pose = gymapi.Transform(p=gymapi.Vec3(back_wall_x, 0, wall_height / 2))
+        left_wall_pose = gymapi.Transform(p=gymapi.Vec3(side_wall_center_x, left_wall_y, wall_height / 2))
+        right_wall_pose = gymapi.Transform(p=gymapi.Vec3(side_wall_center_x, right_wall_y, wall_height / 2))
+        goal_wall_pose = gymapi.Transform(p=gymapi.Vec3(goal_wall_x, 0, wall_height / 2))
+
+        # --- 3. CRIAR AMBIENTES E ATORES ---
         self._get_env_origins()
         env_lower = gymapi.Vec3(0.0, 0.0, 0.0)
         env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
         self.envs = []
         self.robot_actor_handles = []
 
+        field_min_x = back_wall_x
+        field_max_x = self.goal_x_pos
+        field_min_y = left_wall_y
+        field_max_y = right_wall_y
+
         print(f"Criando {self.num_envs} ambientes...")
         for i in range(self.num_envs):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
             self.envs.append(env_handle)
             
-            # Pega a origem deste ambiente específico (que é um tensor)
-            env_origin_tensor = self.env_origins[i]
-            # Converte o tensor para um objeto Vec3 que o Isaac Gym entende
-            env_origin_vec3 = gymapi.Vec3(env_origin_tensor[0], env_origin_tensor[1], env_origin_tensor[2])
+            env_origin_vec3 = gymapi.Vec3(self.env_origins[i,0], self.env_origins[i,1], self.env_origins[i,2])
 
-            # Agora, a soma é entre dois objetos Vec3, o que é válido
-            robot_pose = gymapi.Transform(p=robot_start_pose.p + env_origin_vec3, r=robot_start_pose.r)
-            ball_pose = gymapi.Transform(p=ball_start_pose.p + env_origin_vec3, r=ball_start_pose.r)
+            start_pos_robot = gymapi.Vec3(np.random.uniform(field_min_x, field_max_x), np.random.uniform(field_min_y, field_max_y), self.robot_initial_z)
+            start_pos_ball = gymapi.Vec3(np.random.uniform(field_min_x, field_max_x), np.random.uniform(field_min_y, field_max_y), self.ball_radius)
+            
+            robot_pose = gymapi.Transform(p=start_pos_robot + env_origin_vec3, r=self.initial_robot_quat)
+            ball_pose = gymapi.Transform(p=start_pos_ball + env_origin_vec3)
             l_post_pose = gymapi.Transform(p=left_post_pose.p + env_origin_vec3, r=left_post_pose.r)
             r_post_pose = gymapi.Transform(p=right_post_pose.p + env_origin_vec3, r=right_post_pose.r)
             c_bar_pose = gymapi.Transform(p=crossbar_pose.p + env_origin_vec3, r=crossbar_pose.r)
+            b_wall_pose = gymapi.Transform(p=back_wall_pose.p + env_origin_vec3, r=back_wall_pose.r)
+            l_wall_pose = gymapi.Transform(p=left_wall_pose.p + env_origin_vec3, r=left_wall_pose.r)
+            r_wall_pose = gymapi.Transform(p=right_wall_pose.p + env_origin_vec3, r=right_wall_pose.r)
+            g_wall_pose = gymapi.Transform(p=goal_wall_pose.p + env_origin_vec3, r=goal_wall_pose.r)
             
-            # Adicionar Robô
-            robot_handle = self.gym.create_actor(env_handle, robot_asset, robot_pose, asset_cfg["name"], i, asset_cfg["self_collisions"], 0)
+            collision_group = 0
+            collision_filter = -1
+
+            # Criando atores com os filtros corretos
+            robot_handle = self.gym.create_actor(env_handle, robot_asset, robot_pose, "robot", collision_group, collision_filter)
+            ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "ball", collision_group, collision_filter)
+            left_post_handle = self.gym.create_actor(env_handle, post_asset, l_post_pose, "left_post", collision_group, collision_filter)
+            right_post_handle = self.gym.create_actor(env_handle, post_asset, r_post_pose, "right_post", collision_group, collision_filter)
+            crossbar_handle = self.gym.create_actor(env_handle, crossbar_asset, c_bar_pose, "crossbar", collision_group, collision_filter)
+
+            self.gym.create_actor(env_handle, back_wall_asset, b_wall_pose, "back_wall", collision_group, collision_filter)
+            self.gym.create_actor(env_handle, side_wall_asset, l_wall_pose, "left_wall", collision_group, collision_filter)
+            self.gym.create_actor(env_handle, side_wall_asset, r_wall_pose, "right_wall", collision_group, collision_filter)
+            self.gym.create_actor(env_handle, back_wall_asset, g_wall_pose, "goal_wall", collision_group, collision_filter)
+            
+            # Configurações dos atores
             self.robot_actor_handles.append(robot_handle)
             body_props = self.gym.get_actor_rigid_body_properties(env_handle, robot_handle)
             self.gym.set_actor_rigid_body_properties(env_handle, robot_handle, body_props, recomputeInertia=True)
@@ -117,29 +150,54 @@ class Soccer(BaseTask):
             dof_props["stiffness"].fill(0.0)
             dof_props["damping"].fill(5.0)
             self.gym.set_actor_dof_properties(env_handle, robot_handle, dof_props)
-
-            # Adicionar Bola
-            ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "ball", i, 0)
+            
             self.ball_handles.append(ball_handle)
             ball_props = self.gym.get_actor_rigid_body_properties(env_handle, ball_handle)
             ball_props[0].mass = 0.43
             self.gym.set_actor_rigid_body_properties(env_handle, ball_handle, ball_props)
-
-            # Adicionar Gol
-            left_post_handle = self.gym.create_actor(env_handle, post_asset, l_post_pose, "left_post", i, 0)
-            right_post_handle = self.gym.create_actor(env_handle, post_asset, r_post_pose, "right_post", i, 0)
-            crossbar_handle = self.gym.create_actor(env_handle, crossbar_asset, c_bar_pose, "crossbar", i, 0)
+            
             self.goal_handles.extend([left_post_handle, right_post_handle, crossbar_handle])
 
     def _get_env_origins(self):
-        """Calcula as posições de origem para cada ambiente, organizando-os em uma grade."""
+        """
+        Calcula as origens para cada ambiente, garantindo que eles não se sobreponham.
+        O espaçamento é baseado nas dimensões totais de um único ambiente (campo + paredes).
+        """
+        # --- 1. Calcular as dimensões totais de um ambiente ---
+        self.goal_x_pos = 4.0
+        back_wall_x = self.goal_x_pos - self.field_dims.x
+        goal_wall_x = self.goal_x_pos + 1.0
+
+        # Encontra os limites extremos em X e Y, incluindo a espessura das paredes
+        min_x = back_wall_x - self.wall_thickness / 2
+        max_x = goal_wall_x + self.wall_thickness / 2
+        min_y = -self.field_dims.y / 2 - self.wall_thickness / 2
+        max_y = self.field_dims.y / 2 + self.wall_thickness / 2
+
+        # Largura e profundidade total de um ambiente
+        env_width = max_x - min_x
+        env_depth = max_y - min_y
+
+        # Define um buffer para dar um espaço extra entre os ambientes
+        spacing_buffer = 2.0  # Você pode ajustar este valor
+
+        spacing_x = env_width + spacing_buffer
+        spacing_y = env_depth + spacing_buffer
+        
+        print(f"Espaçamento dinâmico calculado: X={spacing_x:.2f}, Y={spacing_y:.2f}")
+
+        # --- 2. Criar a grade de origens com o espaçamento calculado ---
         self.env_origins = torch.zeros(self.num_envs, 3, device=self.device)
-        spacing = self.cfg["env"]["env_spacing"]
+        
         num_cols = int(np.sqrt(self.num_envs))
-        num_rows = int(np.ceil(self.num_envs / num_cols))
-        xx, yy = torch.meshgrid(torch.arange(float(num_rows)), torch.arange(float(num_cols)), indexing="ij")
-        self.env_origins[:, 0] = spacing * xx.flatten()[: self.num_envs]
-        self.env_origins[:, 1] = spacing * yy.flatten()[: self.num_envs]
+        
+        # Otimização para criar a grade de forma eficiente
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        env_rows = torch.div(env_ids, num_cols, rounding_mode='floor')
+        env_cols = torch.remainder(env_ids, num_cols)
+
+        self.env_origins[:, 0] = env_cols * spacing_x
+        self.env_origins[:, 1] = env_rows * spacing_y
         self.env_origins[:, 2] = 0.0
     
     def _init_simulation_buffers(self):
@@ -151,7 +209,6 @@ class Soccer(BaseTask):
 
         self.root_states_tensor = gymtorch.wrap_tensor(actor_root_state)
 
-        # Cada ambiente agora tem 1 robô + 1 bola + 3 partes do gol = 5 atores
         self.num_actors = self.gym.get_sim_actor_count(self.sim) // self.num_envs
         self.robot_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 0, :]
         self.ball_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 1, :]
@@ -163,14 +220,26 @@ class Soccer(BaseTask):
         self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
 
     def step(self, actions):
+        if not self._kick_applied:
+            goal_center = torch.tensor([self.goal_x_pos, 0, self.ball_radius], device=self.device)
+            ball_positions_relative = self.ball_root_states[:, :3] - self.env_origins
+            
+            direction_to_goal = goal_center - ball_positions_relative
+            direction_to_goal = torch.nn.functional.normalize(direction_to_goal, p=2, dim=1)
+            
+            kick_vec = direction_to_goal * self.kick_velocity
+            
+            self.ball_root_states[:, 7:10] = kick_vec
+            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states_tensor))
+            self._kick_applied = True
+
         self.torques[:] = torch.clip(actions, -100.0, 100.0)
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
         
         self.gym.simulate(self.sim)
-        self.root_states = self.root_states_tensor # Garante que a BaseTask possa renderizar
+        self.root_states = self.root_states_tensor
         self.render()
 
-    # As funções abaixo são exigidas pela estrutura, mas não precisam fazer nada por enquanto.
     def reset(self):
         pass
 
