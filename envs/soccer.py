@@ -99,7 +99,7 @@ class Soccer(BaseTask):
         self.envs = []
         self.robot_actor_handles = []
 
-        field_min_x = self.goal_x_pos - 1.0
+        field_min_x = back_wall_x
         field_max_x = self.goal_x_pos
         field_min_y = left_wall_y
         field_max_y = right_wall_y
