@@ -12,6 +12,12 @@ class Soccer(BaseTask):
     def __init__(self, cfg):
         super().__init__(cfg)
 
+        # --- Alterações Início ---
+        self.add_goal = self.cfg["env"].get("add_goal", False)
+        self.apply_initial_kick = self.cfg["env"].get("apply_initial_kick", False)
+        self.kick_velocity = self.cfg["env"].get("kick_velocity", 10.0)  # Lido do cfg
+        # --- Alterações Fim ---
+
         self.ball_handles = []
         self.goal_handles = []
         
@@ -22,7 +28,6 @@ class Soccer(BaseTask):
         self.gym.prepare_sim(self.sim)
         self._init_simulation_buffers()
 
-        self.kick_velocity = 10.0  
         self._kick_applied = False
 
     def _create_envs(self):
@@ -53,11 +58,14 @@ class Soccer(BaseTask):
         self.ball_radius = 0.11
         ball_asset = self.gym.create_sphere(self.sim, self.ball_radius, ball_options)
         
-        goal_options = gymapi.AssetOptions()
-        goal_options.fix_base_link = True
+        # Definir dimensões do gol (necessário para paredes, mesmo se o gol não for criado)
         goal_width, goal_height, post_thickness = 1.8, 1.2, 0.1
-        post_asset = self.gym.create_box(self.sim, post_thickness, post_thickness, goal_height, goal_options)
-        crossbar_asset = self.gym.create_box(self.sim, post_thickness, goal_width, post_thickness, goal_options)
+
+        if self.add_goal:
+            goal_options = gymapi.AssetOptions()
+            goal_options.fix_base_link = True
+            post_asset = self.gym.create_box(self.sim, post_thickness, post_thickness, goal_height, goal_options)
+            crossbar_asset = self.gym.create_box(self.sim, post_thickness, goal_width, post_thickness, goal_options)
         
         # --- CORREÇÃO 1: Geometria das Paredes ---
         self.goal_x_pos = 4.0
@@ -66,7 +74,7 @@ class Soccer(BaseTask):
 
         wall_options = gymapi.AssetOptions()
         wall_options.fix_base_link = True
-        wall_height = goal_height * 1.5
+        wall_height = goal_height * 1.5 # Agora goal_height está sempre definida
 
         # Novo comprimento e centro para as paredes laterais
         side_wall_length = goal_wall_x - back_wall_x
@@ -79,10 +87,11 @@ class Soccer(BaseTask):
         self.robot_initial_z = self.cfg["init_state"]["pos"][2]
         self.initial_robot_quat = gymapi.Quat(*self.cfg["init_state"]["rot"])
         
-        goal_physical_x = self.goal_x_pos + post_thickness / 2
-        left_post_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, -goal_width / 2, goal_height / 2))
-        right_post_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, goal_width / 2, goal_height / 2))
-        crossbar_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, 0, goal_height), r=gymapi.Quat(0,0,0,1))
+        if self.add_goal:
+            goal_physical_x = self.goal_x_pos + post_thickness / 2 # post_thickness está sempre definida
+            left_post_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, -goal_width / 2, goal_height / 2))
+            right_post_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, goal_width / 2, goal_height / 2))
+            crossbar_pose = gymapi.Transform(p=gymapi.Vec3(goal_physical_x, 0, goal_height), r=gymapi.Quat(0,0,0,1))
         
         left_wall_y = -self.field_dims.y / 2
         right_wall_y = self.field_dims.y / 2
@@ -116,9 +125,12 @@ class Soccer(BaseTask):
             
             robot_pose = gymapi.Transform(p=start_pos_robot + env_origin_vec3, r=self.initial_robot_quat)
             ball_pose = gymapi.Transform(p=start_pos_ball + env_origin_vec3)
-            l_post_pose = gymapi.Transform(p=left_post_pose.p + env_origin_vec3, r=left_post_pose.r)
-            r_post_pose = gymapi.Transform(p=right_post_pose.p + env_origin_vec3, r=right_post_pose.r)
-            c_bar_pose = gymapi.Transform(p=crossbar_pose.p + env_origin_vec3, r=crossbar_pose.r)
+            
+            if self.add_goal:
+                l_post_pose = gymapi.Transform(p=left_post_pose.p + env_origin_vec3, r=left_post_pose.r)
+                r_post_pose = gymapi.Transform(p=right_post_pose.p + env_origin_vec3, r=right_post_pose.r)
+                c_bar_pose = gymapi.Transform(p=crossbar_pose.p + env_origin_vec3, r=crossbar_pose.r)
+
             b_wall_pose = gymapi.Transform(p=back_wall_pose.p + env_origin_vec3, r=back_wall_pose.r)
             l_wall_pose = gymapi.Transform(p=left_wall_pose.p + env_origin_vec3, r=left_wall_pose.r)
             r_wall_pose = gymapi.Transform(p=right_wall_pose.p + env_origin_vec3, r=right_wall_pose.r)
@@ -130,9 +142,11 @@ class Soccer(BaseTask):
             # Criando atores com os filtros corretos
             robot_handle = self.gym.create_actor(env_handle, robot_asset, robot_pose, "robot", collision_group, collision_filter)
             ball_handle = self.gym.create_actor(env_handle, ball_asset, ball_pose, "ball", collision_group, collision_filter)
-            left_post_handle = self.gym.create_actor(env_handle, post_asset, l_post_pose, "left_post", collision_group, collision_filter)
-            right_post_handle = self.gym.create_actor(env_handle, post_asset, r_post_pose, "right_post", collision_group, collision_filter)
-            crossbar_handle = self.gym.create_actor(env_handle, crossbar_asset, c_bar_pose, "crossbar", collision_group, collision_filter)
+
+            if self.add_goal:
+                left_post_handle = self.gym.create_actor(env_handle, post_asset, l_post_pose, "left_post", collision_group, collision_filter)
+                right_post_handle = self.gym.create_actor(env_handle, post_asset, r_post_pose, "right_post", collision_group, collision_filter)
+                crossbar_handle = self.gym.create_actor(env_handle, crossbar_asset, c_bar_pose, "crossbar", collision_group, collision_filter)
 
             self.gym.create_actor(env_handle, back_wall_asset, b_wall_pose, "back_wall", collision_group, collision_filter)
             self.gym.create_actor(env_handle, side_wall_asset, l_wall_pose, "left_wall", collision_group, collision_filter)
@@ -156,7 +170,8 @@ class Soccer(BaseTask):
             ball_props[0].mass = 0.43
             self.gym.set_actor_rigid_body_properties(env_handle, ball_handle, ball_props)
             
-            self.goal_handles.extend([left_post_handle, right_post_handle, crossbar_handle])
+            if self.add_goal:
+                self.goal_handles.extend([left_post_handle, right_post_handle, crossbar_handle])
 
     def _get_env_origins(self):
         """
@@ -220,7 +235,7 @@ class Soccer(BaseTask):
         self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
 
     def step(self, actions):
-        if not self._kick_applied:
+        if self.apply_initial_kick and not self._kick_applied:
             goal_center = torch.tensor([self.goal_x_pos, 0, self.ball_radius], device=self.device)
             ball_positions_relative = self.ball_root_states[:, :3] - self.env_origins
             
