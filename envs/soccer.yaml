@@ -12,6 +12,23 @@ basic:
 env:
   num_envs: 16
   env_spacing: 5.0
+  # Flag para posições iniciais (default: False = centro do campo)
+  randomize_init_pos: False 
+
+  # Ganhos do controlador PD para manter o robô em pé
+  pd_gains:
+    kp: 80.0  # Ganho Proporcional (P)
+    kd: 1.2   # Ganho Derivativo (D)
+  
+  stand_pose_file: "deploy/models/T1.pt"
+
+camera:
+  link_name: "H2"
+  hfov_real_deg: 87.0
+  vfov_real_deg: 58.0
+
+control:
+  action_scale: 1.0
 
 viewer:
   pos: [5., -5., 4.]  # Posição da câmera para ver o campo
@@ -39,18 +56,16 @@ sim:
     num_subscenes: 4
     contact_collection: 1
 
-asset:
-  # --- SEÇÃO CRÍTICA: Copiada do original para garantir carregamento correto ---
-  
+asset:  
   # !!! VERIFIQUE SE ESTE CAMINHO ESTÁ CORRETO PARA O SEU PROJETO !!!
   file: "resources/T1/T1_locomotion.urdf"
 
   name: "T1"
   disable_gravity: false
-  collapse_fixed_joints: true
+  collapse_fixed_joints: false
   fix_base_link: false
   self_collisions: 0 # 0 para habilitar
-  flip_visual_attachments: false # Essencial para renderizar o robô corretamente
+  flip_visual_attachments: false 
 
   # Parâmetros físicos do asset para estabilidade
   density: 0.001
@@ -63,7 +78,7 @@ asset:
 
 init_state:
   # Posição inicial segura para evitar colisão no primeiro frame
-  pos: [0.0, 0.0, 1.0] # x,y,z [m]
+  pos: [0.0, 0.0, 0.8] # x,y,z [m]
   rot: [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
   lin_vel: [0.0, 0.0, 0.0]
   ang_vel: [0.0, 0.0, 0.0]
@@ -76,12 +91,27 @@ terrain:
   dynamic_friction: 1.0
   restitution: 0.
 
+normalization:
+  gravity: 1.0
+  lin_vel: 1.0
+  ang_vel: 1.0
+  dof_pos: 1.0
+  dof_vel: 0.1
+  filter_weight: 0.1
+  push_force: 0.1
+  push_torque: 0.5
+  clip_actions: 1.
+
+control:
+  stiffness: {"Hip": 200., "Knee": 200., "Ankle": 50.} # [N*m/rad]
+  damping: {"Hip": 5., "Knee": 5., "Ankle": 1.} # [N*m*s/rad]
+  action_scale: 1.
+  decimation: 10
+
 # As seções a seguir foram removidas por não serem necessárias para a visualização:
 # - runner
 # - algorithm
 # - control
-# - commands
-# - normalization
 # - noise
 # - randomization
 # - rewards

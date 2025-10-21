@@ -1,9 +1,15 @@
 import os
 from isaacgym import gymtorch, gymapi
-from isaacgym.torch_utils import to_torch, quat_from_euler_xyz, torch_rand_float
+from isaacgym.torch_utils import (
+    to_torch, 
+    quat_rotate_inverse, 
+    quat_from_euler_xyz, 
+    torch_rand_float
+)
 import torch
 import numpy as np
 from .base_task import BaseTask
+from .utils.camera import VirtualCamera 
 
 assert gymtorch
 
@@ -12,12 +18,47 @@ class Soccer(BaseTask):
     def __init__(self, cfg):
         super().__init__(cfg)
 
-        # --- Alterações Início ---
+        self.num_envs = self.cfg["env"]["num_envs"]
+        self.camera = VirtualCamera(self.cfg, self.num_envs, self.device)
+
         self.add_goal = self.cfg["env"].get("add_goal", False)
         self.apply_initial_kick = self.cfg["env"].get("apply_initial_kick", False)
-        self.kick_velocity = self.cfg["env"].get("kick_velocity", 10.0)  # Lido do cfg
-        # --- Alterações Fim ---
+        self.kick_velocity = self.cfg["env"].get("kick_velocity", 10.0)  
 
+        self.randomize_init_pos = self.cfg["env"].get("randomize_init_pos", False) 
+        
+        self.dof_stiffness = None
+        self.dof_damping = None
+        
+        control_cfg = self.cfg.get("control", {}) 
+        self.action_scale = control_cfg.get("action_scale", 1.0) 
+        print(f"Action Scale: {self.action_scale}")
+        
+        norm_cfg = self.cfg.get("normalization", {}) 
+        self.norm_gravity_scale = norm_cfg.get("gravity", 1.0)
+        self.norm_ang_vel_scale = norm_cfg.get("ang_vel", 1.0)
+        self.norm_lin_vel_scale = norm_cfg.get("lin_vel", 1.0) 
+        self.norm_dof_pos_scale = norm_cfg.get("dof_pos", 1.0)
+        self.norm_dof_vel_scale = norm_cfg.get("dof_vel", 1.0)
+        self.action_clip = norm_cfg.get("clip_actions", 100.0) 
+        self.commands_scale = torch.tensor(
+            [self.norm_lin_vel_scale, self.norm_lin_vel_scale, self.norm_ang_vel_scale],
+            device=self.device, dtype=torch.float32
+        )
+        print("Normalization Scales Loaded.") 
+        print(f"Action Clip: +/- {self.action_clip}")
+        
+        policy_file = self.cfg["env"].get("stand_pose_file", "deploy/models/T1.pt")
+        
+        try:
+            self.stand_policy = torch.load(policy_file, map_location=self.device)
+            self.stand_policy.eval() 
+            print(f"Política para ficar em pé '{policy_file}' carregada com sucesso.")
+        except Exception as e:
+            print(f"ERRO: Falha ao carregar a política '{policy_file}'. O robô não ficará em pé.")
+            print(e)
+            self.stand_policy = None 
+ 
         self.ball_handles = []
         self.goal_handles = []
         
@@ -26,12 +67,14 @@ class Soccer(BaseTask):
         self.wall_thickness = 0.1
         self._create_envs()
         self.gym.prepare_sim(self.sim)
+        
+        self.step_count = 0 
+
         self._init_simulation_buffers()
 
         self._kick_applied = False
 
     def _create_envs(self):
-        self.num_envs = self.cfg["env"]["num_envs"]
         asset_cfg = self.cfg["asset"]
         asset_root = os.path.dirname(asset_cfg["file"])
         asset_file = os.path.basename(asset_cfg["file"])
@@ -52,7 +95,34 @@ class Soccer(BaseTask):
         if "thickness" in asset_cfg: asset_options.thickness = asset_cfg["thickness"]
         robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
         self.num_dofs = self.gym.get_asset_dof_count(robot_asset)
+        self.dof_names = self.gym.get_asset_dof_names(robot_asset)
+
+        # CARREGAR stiffness e damping específicos por junta (como em T1.py)
+        self.dof_stiffness = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+        self.dof_damping = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         
+        if "control" not in self.cfg or "stiffness" not in self.cfg["control"] or "damping" not in self.cfg["control"]:
+             raise ValueError("cfg['control']['stiffness'] and cfg['control']['damping'] must be defined in the config file.")
+        
+        for i in range(self.num_dofs):
+            found = False
+            for name in self.cfg["control"]["stiffness"].keys():
+                if name in self.dof_names[i]:
+                    self.dof_stiffness[:, i] = self.cfg["control"]["stiffness"][name]
+                    self.dof_damping[:, i] = self.cfg["control"]["damping"][name]
+                    found = True
+                    break 
+            if not found:
+                raise ValueError(f"PD gain of joint {self.dof_names[i]} was not defined in cfg['control']['stiffness/damping']")
+        print("Per-joint stiffness and damping loaded from CFG.")
+        
+        # Encontra o índice do link da cabeça/câmera... 
+        self.head_link_name = self.cfg["camera"].get("link_name", "ERROR_NO_LINK_NAME_IN_CFG") 
+        # ... (resto do código de encontrar link da câmera) ...
+        self.head_link_index = self.gym.find_asset_rigid_body_index(robot_asset, self.head_link_name)
+        if self.head_link_index == -1: print(f"ALERTA: Link da câmera '{self.head_link_name}' NÃO ENCONTRADO...") # Mensagem abreviada
+        else: print(f"Link da câmera '{self.head_link_name}' encontrado no índice {self.head_link_index}.")
+
         ball_options = gymapi.AssetOptions()
         ball_options.disable_gravity = False
         self.ball_radius = 0.11
@@ -120,8 +190,15 @@ class Soccer(BaseTask):
             
             env_origin_vec3 = gymapi.Vec3(self.env_origins[i,0], self.env_origins[i,1], self.env_origins[i,2])
 
-            start_pos_robot = gymapi.Vec3(np.random.uniform(field_min_x, field_max_x), np.random.uniform(field_min_y, field_max_y), self.robot_initial_z)
-            start_pos_ball = gymapi.Vec3(np.random.uniform(field_min_x, field_max_x), np.random.uniform(field_min_y, field_max_y), self.ball_radius)
+            # Posições iniciais (randomizadas ou fixas)
+            if self.randomize_init_pos:
+                start_pos_robot = gymapi.Vec3(np.random.uniform(field_min_x, field_max_x), np.random.uniform(field_min_y, field_max_y), self.robot_initial_z)
+                start_pos_ball = gymapi.Vec3(np.random.uniform(field_min_x, field_max_x), np.random.uniform(field_min_y, field_max_y), self.ball_radius)
+            else:
+                center_x = (field_min_x + field_max_x) / 2.0
+                center_y = (field_min_y + field_max_y) / 2.0
+                start_pos_robot = gymapi.Vec3(center_x, center_y, self.robot_initial_z)
+                start_pos_ball = gymapi.Vec3(center_x + 1.0, center_y, self.ball_radius)
             
             robot_pose = gymapi.Transform(p=start_pos_robot + env_origin_vec3, r=self.initial_robot_quat)
             ball_pose = gymapi.Transform(p=start_pos_ball + env_origin_vec3)
@@ -161,8 +238,8 @@ class Soccer(BaseTask):
             self.gym.set_actor_rigid_shape_properties(env_handle, robot_handle, shape_props)
             dof_props = self.gym.get_actor_dof_properties(env_handle, robot_handle)
             dof_props["driveMode"].fill(gymapi.DOF_MODE_EFFORT)
-            dof_props["stiffness"].fill(0.0)
-            dof_props["damping"].fill(5.0)
+            dof_props["stiffness"].fill(0.0) # Stiffness do motor é 0, o controle é feito pelo PD calculado
+            dof_props["damping"].fill(0.0) # Damping do motor é 0, o controle é feito pelo PD calculado
             self.gym.set_actor_dof_properties(env_handle, robot_handle, dof_props)
             
             self.ball_handles.append(ball_handle)
@@ -174,10 +251,6 @@ class Soccer(BaseTask):
                 self.goal_handles.extend([left_post_handle, right_post_handle, crossbar_handle])
 
     def _get_env_origins(self):
-        """
-        Calcula as origens para cada ambiente, garantindo que eles não se sobreponham.
-        O espaçamento é baseado nas dimensões totais de um único ambiente (campo + paredes).
-        """
         # --- 1. Calcular as dimensões totais de um ambiente ---
         self.goal_x_pos = 4.0
         back_wall_x = self.goal_x_pos - self.field_dims.x
@@ -218,21 +291,59 @@ class Soccer(BaseTask):
     def _init_simulation_buffers(self):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
 
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
 
+        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
         self.root_states_tensor = gymtorch.wrap_tensor(actor_root_state)
+        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
 
         self.num_actors = self.gym.get_sim_actor_count(self.sim) // self.num_envs
         self.robot_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 0, :]
         self.ball_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 1, :]
         
-        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+        if self.head_link_index != -1:
+            self.head_states = self.rigid_body_states[:, self.head_link_index, :]
+        else:
+            self.head_states = torch.empty((self.num_envs, 13), device=self.device) 
+
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 1]
         
         self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+
+        # Buffers para controle e observação (como em T1.py)
+        self.dof_pos_targets = torch.zeros_like(self.dof_pos)
+        self.gravity_vec = to_torch([0, 0, -1.0], device=self.device).repeat((self.num_envs, 1))
+        self.commands = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float32) # x, y, yaw_rate
+        self.gait_frequency = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.gait_process = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+
+        # Carrega a pose estática CORRETA do CFG
+        self.default_dof_pos = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+        if "init_state" not in self.cfg or "default_joint_angles" not in self.cfg["init_state"]:
+            print("ALERTA: 'default_joint_angles' não encontrado... Usando 0.0.")
+            default_angles_cfg = {"default": 0.0}
+        else:
+            default_angles_cfg = self.cfg["init_state"]["default_joint_angles"]
+
+        for i in range(self.num_dofs):
+            found = False
+            for name in default_angles_cfg.keys():
+                if name in self.dof_names[i]:
+                    self.default_dof_pos[:, i] = default_angles_cfg[name]
+                    found = True
+                    break 
+            if not found:
+                default_val = default_angles_cfg.get("default", 0.0)
+                if "default" not in default_angles_cfg:
+                     print(f"ALERTA: Posição default para {self.dof_names[i]} não encontrada. Usando 0.0.")
+                self.default_dof_pos[:, i] = default_val
+        print("Pose estática (default_dof_pos) carregada do CFG.")
+
 
     def step(self, actions):
         if self.apply_initial_kick and not self._kick_applied:
@@ -248,10 +359,49 @@ class Soccer(BaseTask):
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states_tensor))
             self._kick_applied = True
 
-        self.torques[:] = torch.clip(actions, -100.0, 100.0)
+        # --- Alterações (Correção PD Gains / Normalização) ---
+        policy_actions_clipped = torch.zeros_like(self.dof_pos) 
+
+        if self.stand_policy is not None:
+            with torch.no_grad():
+                projected_gravity = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.gravity_vec)
+                base_ang_vel = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.robot_root_states[:, 10:13])
+
+                cos_gait = (torch.cos(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1)
+                sin_gait = (torch.sin(2 * torch.pi * self.gait_process) * (self.gait_frequency > 1.0e-8).float()).unsqueeze(-1)
+                
+                last_actions_for_obs = self.dof_pos_targets 
+
+                obs_batch = torch.cat([(projected_gravity * self.norm_gravity_scale),     
+                                       (base_ang_vel * self.norm_ang_vel_scale),         
+                                       (self.commands * self.commands_scale),            
+                                       cos_gait,                                         
+                                       sin_gait,                                         
+                                       ((self.dof_pos - self.default_dof_pos) * self.norm_dof_pos_scale), 
+                                       (self.dof_vel * self.norm_dof_vel_scale),         
+                                       last_actions_for_obs                              
+                                      ], dim=-1)
+                
+                policy_actions_raw = self.stand_policy(obs_batch) 
+                
+                policy_actions_clipped = torch.clip(policy_actions_raw, -self.action_clip, self.action_clip)
+
+        # 6. O alvo é a pose default + (escala * offset CLIPADO da política)
+        self.dof_pos_targets[:] = self.default_dof_pos + self.action_scale * policy_actions_clipped
+
+        # 7. Calcular torques com os ganhos CORRETOS por junta
+        torques = self.dof_stiffness * (self.dof_pos_targets - self.dof_pos) - self.dof_damping * self.dof_vel
+        
+        self.torques[:] = torch.clip(torques, -100.0, 100.0) 
+        
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
         
         self.gym.simulate(self.sim)
+
+        self.gym.refresh_rigid_body_state_tensor(self.sim) 
+        self.gym.refresh_dof_state_tensor(self.sim) 
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+
         self.root_states = self.root_states_tensor
         self.render()
 
