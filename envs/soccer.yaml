@@ -21,6 +21,7 @@ env:
     kd: 1.2   # Ganho Derivativo (D)
   
   stand_pose_file: "deploy/models/T1.pt"
+  enable_terminal_control: False
 
 camera:
   link_name: "H2"

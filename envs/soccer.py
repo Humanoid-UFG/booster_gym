@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from .base_task import BaseTask
 from .utils.camera import VirtualCamera 
+from .utils.utils import TerminalVelocityControl
 
 assert gymtorch
 
@@ -20,6 +21,16 @@ class Soccer(BaseTask):
 
         self.num_envs = self.cfg["env"]["num_envs"]
         self.camera = VirtualCamera(self.cfg, self.num_envs, self.device)
+
+        self.enable_terminal_control = self.cfg["env"].get("enable_terminal_control", False)
+        self.terminal_control = None
+
+        if self.enable_terminal_control:
+            print("Controle de velocidade pelo terminal [ATIVADO].")
+            self.terminal_control = TerminalVelocityControl(self.device)
+            self.terminal_control.start()
+        else:
+            print("Controle de velocidade pelo terminal [DESATIVADO].")
 
         self.add_goal = self.cfg["env"].get("add_goal", False)
         self.apply_initial_kick = self.cfg["env"].get("apply_initial_kick", False)
@@ -346,6 +357,9 @@ class Soccer(BaseTask):
 
 
     def step(self, actions):
+        if self.enable_terminal_control:
+            self.commands[:] = self.terminal_control.get_commands()
+            
         if self.apply_initial_kick and not self._kick_applied:
             goal_center = torch.tensor([self.goal_x_pos, 0, self.ball_radius], device=self.device)
             ball_positions_relative = self.ball_root_states[:, :3] - self.env_origins
