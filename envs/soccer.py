@@ -4,7 +4,10 @@ from isaacgym.torch_utils import (
     to_torch, 
     quat_rotate_inverse, 
     quat_from_euler_xyz, 
-    torch_rand_float
+    torch_rand_float,
+    get_axis_params,
+    get_euler_xyz,
+    quat_rotate,
 )
 import torch
 import numpy as np
@@ -19,19 +22,39 @@ class Soccer(BaseTask):
     def __init__(self, cfg):
         super().__init__(cfg)
 
+        self.is_training_mode = self.cfg["env"].get("enable_training_mode", False)
+        
         self.num_envs = self.cfg["env"]["num_envs"]
-        self.camera = VirtualCamera(self.cfg, self.num_envs, self.device)
 
-        self.enable_terminal_control = self.cfg["env"].get("enable_terminal_control", False)
-        self.terminal_control = None
+        if not self.is_training_mode:
+            print("Modo de Operação: [PLAYER/DEPLOY]")
+            self.camera = VirtualCamera(self.cfg, self.num_envs, self.device)
+            self.enable_terminal_control = self.cfg["env"].get("enable_terminal_control", False)
+            self.terminal_control = None
 
-        if self.enable_terminal_control:
-            print("Controle de velocidade pelo terminal [ATIVADO].")
-            self.terminal_control = TerminalVelocityControl(self.device)
-            self.terminal_control.start()
+            if self.enable_terminal_control:
+                print("Controle de velocidade pelo terminal [ATIVADO].")
+                self.terminal_control = TerminalVelocityControl(self.device)
+                self.terminal_control.start()
+            else:
+                print("Controle de velocidade pelo terminal [DESATIVADO].")
+
+            policy_file = self.cfg["env"].get("stand_pose_file", "deploy/models/T1.pt")
+            
+            try:
+                self.stand_policy = torch.load(policy_file, map_location=self.device)
+                self.stand_policy.eval() 
+                print(f"Política para ficar em pé '{policy_file}' carregada com sucesso.")
+            except Exception as e:
+                print(f"ERRO: Falha ao carregar a política '{policy_file}'. O robô não ficará em pé.")
+                print(e)
+                self.stand_policy = None 
         else:
-            print("Controle de velocidade pelo terminal [DESATIVADO].")
-
+            print("Modo de Operação: [TRAINER]")
+            self.camera = None
+            self.terminal_control = None
+            self.stand_policy = None
+        
         self.add_goal = self.cfg["env"].get("add_goal", False)
         self.apply_initial_kick = self.cfg["env"].get("apply_initial_kick", False)
         self.kick_velocity = self.cfg["env"].get("kick_velocity", 10.0)  
@@ -58,24 +81,14 @@ class Soccer(BaseTask):
         )
         print("Normalization Scales Loaded.") 
         print(f"Action Clip: +/- {self.action_clip}")
-        
-        policy_file = self.cfg["env"].get("stand_pose_file", "deploy/models/T1.pt")
-        
-        try:
-            self.stand_policy = torch.load(policy_file, map_location=self.device)
-            self.stand_policy.eval() 
-            print(f"Política para ficar em pé '{policy_file}' carregada com sucesso.")
-        except Exception as e:
-            print(f"ERRO: Falha ao carregar a política '{policy_file}'. O robô não ficará em pé.")
-            print(e)
-            self.stand_policy = None 
  
         self.ball_handles = []
         self.goal_handles = []
         
-        self.field_dims = gymapi.Vec2(10.0, 6.0)
+        if not self.is_training_mode:
+            self.field_dims = gymapi.Vec2(10.0, 6.0)
+            self.wall_thickness = 0.1
         
-        self.wall_thickness = 0.1
         self._create_envs()
         self.gym.prepare_sim(self.sim)
         
@@ -83,7 +96,11 @@ class Soccer(BaseTask):
 
         self._init_simulation_buffers()
 
-        self._kick_applied = False
+        if self.is_training_mode:
+            self._init_training_buffers()
+            self._prepare_reward_function()
+        else:
+            self._kick_applied = False
 
     def _create_envs(self):
         asset_cfg = self.cfg["asset"]
@@ -131,9 +148,29 @@ class Soccer(BaseTask):
         self.head_link_name = self.cfg["camera"].get("link_name", "ERROR_NO_LINK_NAME_IN_CFG") 
         # ... (resto do código de encontrar link da câmera) ...
         self.head_link_index = self.gym.find_asset_rigid_body_index(robot_asset, self.head_link_name)
-        if self.head_link_index == -1: print(f"ALERTA: Link da câmera '{self.head_link_name}' NÃO ENCONTRADO...") # Mensagem abreviada
+        if self.head_link_index == -1: print(f"ALERTA: Link da câmera '{self.head_link_name}' NÃO ENCONTRADO...")
         else: print(f"Link da câmera '{self.head_link_name}' encontrado no índice {self.head_link_index}.")
 
+        if not self.is_training_mode:
+            self._create_envs_player(robot_asset)
+        else:
+            self._create_envs_trainer(robot_asset)
+
+    def _get_env_origins(self):
+        if not self.is_training_mode:
+            self._get_env_origins_player()
+        else:
+            self._get_env_origins_trainer()
+            
+    def step(self, actions):
+        if self.is_training_mode:
+            return self.step_train(actions)
+        else:
+            self.step_play(actions)
+            return None, None, None, None 
+
+    def _create_envs_player(self, robot_asset):
+        print("Criando ambientes: Modo [PLAYER/DEPLOY]")
         ball_options = gymapi.AssetOptions()
         ball_options.disable_gravity = False
         self.ball_radius = 0.11
@@ -298,65 +335,9 @@ class Soccer(BaseTask):
         self.env_origins[:, 0] = env_cols * spacing_x
         self.env_origins[:, 1] = env_rows * spacing_y
         self.env_origins[:, 2] = 0.0
-    
-    def _init_simulation_buffers(self):
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
-        rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
 
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-
-        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
-        self.root_states_tensor = gymtorch.wrap_tensor(actor_root_state)
-        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
-
-        self.num_actors = self.gym.get_sim_actor_count(self.sim) // self.num_envs
-        self.robot_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 0, :]
-        self.ball_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 1, :]
-        
-        if self.head_link_index != -1:
-            self.head_states = self.rigid_body_states[:, self.head_link_index, :]
-        else:
-            self.head_states = torch.empty((self.num_envs, 13), device=self.device) 
-
-        self.dof_pos = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 0]
-        self.dof_vel = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 1]
-        
-        self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
-
-        # Buffers para controle e observação (como em T1.py)
-        self.dof_pos_targets = torch.zeros_like(self.dof_pos)
-        self.gravity_vec = to_torch([0, 0, -1.0], device=self.device).repeat((self.num_envs, 1))
-        self.commands = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float32) # x, y, yaw_rate
-        self.gait_frequency = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-        self.gait_process = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
-
-        # Carrega a pose estática CORRETA do CFG
-        self.default_dof_pos = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
-        if "init_state" not in self.cfg or "default_joint_angles" not in self.cfg["init_state"]:
-            print("ALERTA: 'default_joint_angles' não encontrado... Usando 0.0.")
-            default_angles_cfg = {"default": 0.0}
-        else:
-            default_angles_cfg = self.cfg["init_state"]["default_joint_angles"]
-
-        for i in range(self.num_dofs):
-            found = False
-            for name in default_angles_cfg.keys():
-                if name in self.dof_names[i]:
-                    self.default_dof_pos[:, i] = default_angles_cfg[name]
-                    found = True
-                    break 
-            if not found:
-                default_val = default_angles_cfg.get("default", 0.0)
-                if "default" not in default_angles_cfg:
-                     print(f"ALERTA: Posição default para {self.dof_names[i]} não encontrada. Usando 0.0.")
-                self.default_dof_pos[:, i] = default_val
-        print("Pose estática (default_dof_pos) carregada do CFG.")
-
-
-    def step(self, actions):
+    def step_play(self, actions):
+        # Esta é a sua função step() original
         if self.enable_terminal_control:
             self.commands[:] = self.terminal_control.get_commands()
             
@@ -419,8 +400,271 @@ class Soccer(BaseTask):
         self.root_states = self.root_states_tensor
         self.render()
 
-    def reset(self):
-        pass
+    def _create_envs_trainer(self, robot_asset):
+        print("Criando ambientes: Modo [TRAINER]")
+        
+        # Lógica de _get_env_origins do T1
+        self._get_env_origins() # Chama o roteador, que chamará _get_env_origins_trainer
+        
+        # Lógica de base_init_state do T1
+        base_init_state_list = (
+            self.cfg["init_state"]["pos"] + self.cfg["init_state"]["rot"] + self.cfg["init_state"]["lin_vel"] + self.cfg["init_state"]["ang_vel"]
+        )
+        self.base_init_state = to_torch(base_init_state_list, device=self.device)
+        start_pose = gymapi.Transform()
+        start_pose.p = gymapi.Vec3(*self.base_init_state[:3])
+
+        env_lower = gymapi.Vec3(0.0, 0.0, 0.0)
+        env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
+        self.envs = []
+        self.robot_actor_handles = []
+        
+        print(f"Criando {self.num_envs} ambientes (Modo Trainer)...")
+        for i in range(self.num_envs):
+            env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
+            pos = self.env_origins[i].clone()
+            start_pose.p = gymapi.Vec3(*pos)
+
+            # T1 cria apenas um ator (robô)
+            # Usando collision group 0, filter 0 (como em T1)
+            actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, "robot", i, 0, 0) 
+            
+            dof_props = self.gym.get_actor_dof_properties(env_handle, actor_handle)
+            dof_props["driveMode"].fill(gymapi.DOF_MODE_EFFORT)
+            dof_props["stiffness"].fill(0.0) 
+            dof_props["damping"].fill(0.0) 
+            self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
+            
+            self.envs.append(env_handle)
+            self.robot_actor_handles.append(actor_handle)
+
+        # Lógica de índices de contato do T1
+        body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        if "rewards" in self.cfg and "terminate_contacts_on" in self.cfg["rewards"]:
+            termination_contact_names = []
+            for name in self.cfg["rewards"]["terminate_contacts_on"]:
+                termination_contact_names.extend([s for s in body_names if name in s])
+            self.termination_contact_indices = torch.zeros(len(termination_contact_names), dtype=torch.long, device=self.device)
+            for i in range(len(termination_contact_names)):
+                self.termination_contact_indices[i] = self.gym.find_asset_rigid_body_index(robot_asset, termination_contact_names[i])
+        else:
+            print("ALERTA: cfg['rewards']['terminate_contacts_on'] não definido. Terminador de colisão desativado.")
+            self.termination_contact_indices = torch.empty(0, dtype=torch.long, device=self.device)
+
+    def _get_env_origins_trainer(self):
+        # Lógica de T1 (terreno plano)
+        print("Calculando espaçamento (Trainer): Modo Grade Fixa (env_spacing)")
+        self.env_origins = torch.zeros(self.num_envs, 3, device=self.device)
+        num_cols = np.floor(np.sqrt(self.num_envs))
+        num_rows = np.ceil(self.num_envs / num_cols)
+        xx, yy = torch.meshgrid(torch.arange(num_rows), torch.arange(num_cols), indexing="ij")
+        
+        spacing = self.cfg["env"].get("env_spacing", 5.0) # Pega do cfg, com fallback
+        
+        self.env_origins[:, 0] = spacing * xx.flatten()[: self.num_envs]
+        self.env_origins[:, 1] = spacing * yy.flatten()[: self.num_envs]
+        self.env_origins[:, 2] = 0.0 # Assumindo terreno plano
+
+    def _init_training_buffers(self):
+        # Buffers específicos de RL (copiados do T1)
+        self.num_obs = self.cfg["env"]["num_observations"]
+        self.num_privileged_obs = self.cfg["env"]["num_privileged_obs"]
+        self.num_actions = self.cfg["env"]["num_actions"]
+        self.dt = self.cfg["control"]["decimation"] * self.cfg["sim"]["dt"]
+
+        self.obs_buf = torch.zeros(self.num_envs, self.num_obs, dtype=torch.float, device=self.device)
+        self.privileged_obs_buf = torch.zeros(self.num_envs, self.num_privileged_obs, dtype=torch.float, device=self.device)
+        self.rew_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.reset_buf = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.time_out_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.extras = {}
+        self.extras["rew_terms"] = {}
+        
+        # Buffers de estado do T1
+        self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device)
+        self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device)
+        self.last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.last_root_vel = torch.zeros_like(self.robot_root_states[:, 7:13])
+        self.last_dof_targets = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+        
+        self.cmd_resample_time = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        
+        # Buffers de estado computados (T1)
+        self.base_lin_vel = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.robot_root_states[:, 7:10])
+        self.base_ang_vel = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.robot_root_states[:, 10:13])
+        self.projected_gravity = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.gravity_vec)
+        
+        print("Buffers específicos do modo [TRAINER] inicializados.")
+
+    def _prepare_reward_function(self):
+        # Lógica de T1 (a ser preenchida com as funções de recompensa)
+        print("Preparando funções de recompensa (Modo Trainer)...")
+        self.reward_scales = self.cfg["rewards"]["scales"].copy()
+        for key in list(self.reward_scales.keys()):
+            scale = self.reward_scales[key]
+            if scale == 0:
+                self.reward_scales.pop(key)
+            else:
+                self.reward_scales[key] *= self.dt
+        
+        self.reward_functions = []
+        self.reward_names = []
+        for name, scale in self.reward_scales.items():
+            self.reward_names.append(name)
+            name = "_reward_" + name
+            # Precisamos verificar se a função existe ANTES de adicioná-la
+            if hasattr(self, name):
+                self.reward_functions.append(getattr(self, name))
+            else:
+                print(f"ALERTA: Função de recompensa '{name}' definida em cfg mas NÃO IMPLEMENTADA na classe.")
+        print(f"Funções de recompensa carregadas: {self.reward_names}")
+
+
+    def step_train(self, actions):
+        # Lógica de step() do T1
+        
+        # 1. Aplicar ações e calcular alvos
+        self.actions[:] = torch.clip(actions, -self.action_clip, self.action_clip)
+        self.dof_pos_targets[:] = self.default_dof_pos + self.action_scale * self.actions
+
+        # 2. Simular (T1 usa 'decimation' - simulação multi-passo)
+        self.torques.zero_()
+        decimation = self.cfg["control"].get("decimation", 1) # Pega do cfg
+        for i in range(decimation):
+            # (A lógica de torque do T1 é mais complexa, mas usamos a nossa por enquanto)
+            torques = self.dof_stiffness * (self.dof_pos_targets - self.dof_pos) - self.dof_damping * self.dof_vel
+            
+            # (A lógica de clip do T1 usa 'torque_limits', que não carregamos. Usando 100.0)
+            self.torques[:] = torch.clip(torques, -100.0, 100.0) 
+            
+            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
+            self.gym.simulate(self.sim)
+            
+            if self.device == 'cpu':
+                self.gym.fetch_results(self.sim, True)
+            
+            self.gym.refresh_dof_state_tensor(self.sim)
+            # (T1 também refresca 'dof_force_tensor')
+        
+        # 3. Refresh dos buffers principais (pós-simulação)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+        # 4. Atualizar estados computados (T1)
+        self.episode_length_buf += 1
+        # (Atualiza estados como base_lin_vel, base_ang_vel, projected_gravity...)
+        self.base_lin_vel[:] = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.robot_root_states[:, 7:10])
+        self.base_ang_vel[:] = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.robot_root_states[:, 10:13])
+        self.projected_gravity[:] = quat_rotate_inverse(self.robot_root_states[:, 3:7], self.gravity_vec)
+        
+        # 5. Chamar o ciclo de RL
+        self._check_termination()
+        self._compute_reward()
+        self._compute_observations()
+
+        # 6. Lidar com resets
+        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+        self.reset(env_ids) 
+        
+        
+        # 8. Retornar buffers para o algoritmo
+        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+    def _init_simulation_buffers(self):
+        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
+        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
+
+        if self.is_training_mode:
+            net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
+            self.gym.refresh_net_contact_force_tensor(self.sim)
+            self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
+
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+
+        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
+        self.root_states_tensor = gymtorch.wrap_tensor(actor_root_state)
+        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+
+        self.num_actors = self.gym.get_sim_actor_count(self.sim) // self.num_envs
+        
+        if not self.is_training_mode:
+            # Modo Player: Múltiplos atores (Robô=0, Bola=1)
+            self.robot_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 0, :]
+            self.ball_root_states = self.root_states_tensor.view(self.num_envs, self.num_actors, 13)[:, 1, :]
+        else:
+            # Modo Trainer: Apenas 1 ator (Robô)
+            self.robot_root_states = self.root_states_tensor # View 2D
+            self.ball_root_states = None 
+        
+        if self.head_link_index != -1:
+            self.head_states = self.rigid_body_states[:, self.head_link_index, :]
+        else:
+            self.head_states = torch.empty((self.num_envs, 13), device=self.device) 
+
+        self.dof_pos = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 0]
+        self.dof_vel = self.dof_state.view(self.num_envs, self.num_dofs, 2)[..., 1]
+        
+        self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+
+        self.dof_pos_targets = torch.zeros_like(self.dof_pos)
+        self.gravity_vec = to_torch([0, 0, -1.0], device=self.device).repeat((self.num_envs, 1))
+        self.commands = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float32) 
+        self.gait_frequency = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        self.gait_process = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+
+        self.default_dof_pos = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+        if "init_state" not in self.cfg or "default_joint_angles" not in self.cfg["init_state"]:
+            print("ALERTA: 'default_joint_angles' não encontrado... Usando 0.0.")
+            default_angles_cfg = {"default": 0.0}
+        else:
+            default_angles_cfg = self.cfg["init_state"]["default_joint_angles"]
+
+        for i in range(self.num_dofs):
+            found = False
+            for name in default_angles_cfg.keys():
+                if name in self.dof_names[i]:
+                    self.default_dof_pos[:, i] = default_angles_cfg[name]
+                    found = True
+                    break 
+            if not found:
+                default_val = default_angles_cfg.get("default", 0.0)
+                if "default" not in default_angles_cfg:
+                     print(f"ALERTA: Posição default para {self.dof_names[i]} não encontrada. Usando 0.0.")
+                self.default_dof_pos[:, i] = default_val
+        print("Pose estática (default_dof_pos) carregada do CFG.")
+
+
+    def reset(self, env_ids=None):
+        if self.is_training_mode:
+            if env_ids is None:
+                env_ids = torch.arange(self.num_envs, device=self.device)
+            if len(env_ids) == 0:
+                return
+
+            self.dof_pos[env_ids] = self.default_dof_pos[env_ids]
+            self.dof_vel[env_ids] = 0.0
+            
+            self.robot_root_states[env_ids] = self.base_init_state
+            self.robot_root_states[env_ids, :2] += self.env_origins[env_ids, :2]
+            
+            env_ids_int32 = env_ids.to(dtype=torch.int32)
+            self.gym.set_dof_state_tensor_indexed(
+                self.sim, gymtorch.unwrap_tensor(self.dof_state), gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32)
+            )
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim, gymtorch.unwrap_tensor(self.root_states_tensor), gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32)
+            )
+            
+            self.episode_length_buf[env_ids] = 0
+            self.reset_buf[env_ids] = 0 
+            
+        else:
+            pass
 
     def _compute_reward(self):
         pass
