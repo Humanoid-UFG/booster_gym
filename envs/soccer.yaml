@@ -11,18 +11,18 @@ basic:
 
 env:
   num_envs: 16
-  env_spacing: 5.0
-  # Flag para posições iniciais (default: False = centro do campo)
-  randomize_init_pos: False 
+  env_spacing: 5.0 # Usado pela nova função _get_env_origins
 
-  # Ganhos do controlador PD para manter o robô em pé
-  pd_gains:
-    kp: 80.0  # Ganho Proporcional (P)
-    kd: 1.2   # Ganho Derivativo (D)
-  
-  stand_pose_file: "deploy/models/T1.pt"
-  enable_terminal_control: False
-  enable_training_mode: False
+  enable_camera: True             # True para abrir a câmera (antes era automático no modo player)
+  policy_file: "deploy/models/T1.pt" # Caminho da política ou 'null' para controlar via step(actions)
+  add_ball: True                  # True para criar a bola
+  add_walls: False                 # True para criar as paredes do campo
+  add_goal: False                  # True para criar o gol (esta flag já existia)
+
+  enable_terminal_control: True   
+  apply_initial_kick: False       
+  randomize_init_pos: False      
+  test_camera: True
 
 camera:
   link_name: "H2"
